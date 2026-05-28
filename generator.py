@@ -9,10 +9,17 @@ from pathlib import Path
 import genanki
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError
 from dotenv import load_dotenv
 from PIL import Image
 
 load_dotenv()
+
+MODEL_CASCADE = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-flash-lite-latest",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,6 +170,42 @@ def load_image_bytes(path: str) -> bytes:
     return buf.getvalue()
 
 
+def parse_response(raw: str, label: str) -> list[dict]:
+    raw = raw.strip()
+
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    items = json.loads(raw)
+    if not isinstance(items, list):
+        raise ValueError("Expected a JSON array")
+    return items
+
+
+def ocr_fallback(image_path: str, label: str) -> list[dict]:
+    try:
+        import pytesseract
+    except ImportError:
+        print(
+            "  OCR fallback unavailable - install pytesseract and the Japanese Tesseract language pack."
+        )
+        return []
+
+    print("  Falling back to OCR ...")
+    img = Image.open(image_path)
+    text = pytesseract.image_to_string(img, lang="jpn+eng")
+    out_path = Path(image_path).stem + "_ocr.txt"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"# OCR output for: {Path(image_path).name}\n")
+        f.write(f"# Mode: {label}\n\n")
+        f.write(text)
+
+    print(f"  OCR text saved to {out_path} - review and add cards manually")
+    return []
+
+
 def extract_from_image(
     client: genai.Client,
     image_path: str,
@@ -172,32 +215,30 @@ def extract_from_image(
     print(f"  Processing {Path(image_path).name} …")
 
     image_bytes = load_image_bytes(image_path)
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            prompt,
-        ],
-    )
+    for model in MODEL_CASCADE:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ],
+            )
+            items = parse_response(response.text, label)
+            print(f"  {len(items)} {label} item(s) found [model: {model}]")
+            return items
 
-    raw = response.text.strip()
+        except ClientError as e:
+            if e.code == 429:
+                print(f"  Rate limit hit on {model}, trying next model ...")
+                continue
+            raise
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"  Could not parse response: {e}")
+            return []
 
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        items = json.loads(raw)
-        if not isinstance(items, list):
-            raise ValueError("Expected a JSON array")
-        print(f"  {len(items)} {label} item(s) found")
-        return items
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"  Could not parse response: {e}")
-        print(f"  Raw output:\n{raw[:500]}")
-        return []
+    print("  All models rate-limited.")
+    return ocr_fallback(image_path, label)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
