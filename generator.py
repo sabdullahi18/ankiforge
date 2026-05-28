@@ -1,5 +1,4 @@
 import argparse
-import base64
 import json
 import os
 import random
@@ -8,7 +7,8 @@ from io import BytesIO
 from pathlib import Path
 
 import genanki
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from PIL import Image
 
@@ -138,10 +138,10 @@ Respond with ONLY a JSON array.
 Each element must have exactly these keys:
   "grammar_point" – the pattern in Japanese (e.g. 〜てもいいです, Nounの, etc.)
   "meaning"       – a concise English gloss of what it expresses
-  "examples"      – 2–3 example sentences from the page,
-                    each pair formatted as:
-                    "Japanese sentence。\\nEnglish translation."
-                    Pairs separated by "\\n\\n"
+  "examples"      –  single STRING (not an array) containing 2-3 example sentence pairs.
+                    Format: "Japanese sentence。\\nEnglish translation."
+                    Separate pairs with "\\n\\n".
+                    Example value: "寒くなります。\\nIt becomes cold.\\n\\n元気になります。\\nI will get well."
   "explanation"   – a clear English explanation of when/how to use the pattern,
                     including conjugation or attachment rules
 
@@ -154,26 +154,30 @@ If no grammar points are found, return an empty array: []
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def load_image_as_base64(path: str) -> tuple[str, str]:
+def load_image_bytes(path: str) -> bytes:
     img = Image.open(path)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
     buf = BytesIO()
     img.save(buf, format="JPEG", quality=90)
-    return base64.b64encode(buf.getvalue()).decode(), "image/jpeg"
+    return buf.getvalue()
 
 
 def extract_from_image(
-    gemini_model: genai.GenerativeModel,
+    client: genai.Client,
     image_path: str,
     prompt: str,
     label: str,
 ) -> list[dict]:
     print(f"  Processing {Path(image_path).name} …")
 
-    b64_data, mime = load_image_as_base64(image_path)
-    response = gemini_model.generate_content(
-        [{"mime_type": mime, "data": b64_data}, prompt]
+    image_bytes = load_image_bytes(image_path)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt,
+        ],
     )
 
     raw = response.text.strip()
@@ -336,14 +340,13 @@ def main() -> None:
         prompt = GRAMMAR_PROMPT
         label = "grammar"
 
-    genai.configure(api_key=api_key)
-    gemini = genai.GenerativeModel("gemini-1.5-flash")
+    client = genai.Client(api_key=api_key)
 
     print(f"\n  Mode: {mode.upper()} | {len(args.images)} image(s)\n")
 
     all_items = []
     for image_path in args.images:
-        items = extract_from_image(gemini, image_path, prompt, label)
+        items = extract_from_image(client, image_path, prompt, label)
         all_items.extend(items)
 
     if not all_items:
